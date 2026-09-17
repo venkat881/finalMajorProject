@@ -1,0 +1,7 @@
+{
+  "drainage": 0,
+  "garbage": 1,
+  "pothole": 2,
+  "street_light_electricity": 3,
+  "water_leakage": 4
+}

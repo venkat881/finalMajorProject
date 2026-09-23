@@ -997,6 +997,10 @@ def classify():
         folder_name
     )
 
+    # Log the model decision so the terminal clearly shows what was classified.
+    print(f"[AI MODEL] Detected Object: {category}")
+    print(f"[AI MODEL] Confidence: {confidence * 100:.2f}%")
+
 
     # --------------------------------------------------------
     # RESPONSE
@@ -1008,7 +1012,10 @@ def classify():
             category,
 
         "confidence":
-            confidence
+            confidence,
+
+        "model": "civic_issue_classifier",
+        "source": "local_tensorflow_model"
 
     })
 

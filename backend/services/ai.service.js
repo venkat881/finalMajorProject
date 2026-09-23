@@ -1,44 +1,4 @@
-/**
- * AI Image Classification Service
- * ---------------------------------------------------------------
- * Isolated from Express controllers so the underlying model/provider
- * can be swapped without touching route/controller code.
- *
- * Supported modes (set AI_MODE in .env):
- *
- *  - "EXTERNAL_API"   Calls a hosted vision model at AI_API_URL using
- *                      AI_API_KEY. Point this at any service that accepts
- *                      an image and returns a category + confidence, e.g.:
- *                        - a Hugging Face Inference Endpoint running an
- *                          image-classification model fine-tuned on civic
- *                          issue photos
- *                        - a custom TensorFlow/PyTorch model served behind
- *                          a small Flask/FastAPI wrapper
- *                        - a cloud vision API (Google Cloud Vision, AWS
- *                          Rekognition custom labels, Azure Custom Vision)
- *                      Adjust `callExternalApi()` below to match whatever
- *                      request/response shape your chosen provider uses.
- *
- *  - "DEV_HEURISTIC"   No external AI account needed. Produces a
- *                      deterministic, explainable "confidence" so the
- *                      full pipeline (thresholds, AI_REVIEW, category
- *                      mismatch handling, etc.) can be developed and
- *                      demoed end-to-end without any AI credentials.
- *                      This is NOT real computer vision — replace it with
- *                      EXTERNAL_API mode before relying on it for anything
- *                      beyond local development.
- *
- * Both modes return the same shape:
- *   { category: string, confidence: number (0-100), raw: any }
- *
- * AI failures NEVER throw out of this module for callers that use
- * classifyIssueImage() — they resolve to a safe fallback result with
- * confidence 0 and a `failed: true` flag, so a downed AI provider can
- * never crash the Express server (Rule 10 / Section 45).
- */
-
 const fs = require('fs');
-const crypto = require('crypto');
 
 const CATEGORIES = [
   'Pothole',
@@ -48,121 +8,218 @@ const CATEGORIES = [
   'Garbage',
 ];
 
+/**
+ * Calls the local Flask TensorFlow classifier from serve.py.
+ *
+ * Python endpoint:
+ *   POST http://localhost:8000/classify
+ *
+ * Expected Python response:
+ *   {
+ *     "category": "Pothole",
+ *     "confidence": 0.97
+ *   }
+ *
+ * Python confidence is 0-1.
+ * This service converts it to 0-100.
+ */
 async function callExternalApi(imagePath) {
-  const apiUrl = process.env.AI_API_URL;
-  const apiKey = process.env.AI_API_KEY;
+  const apiUrl =
+    process.env.AI_API_URL || 'http://localhost:8000/classify';
 
   const imageBuffer = fs.readFileSync(imagePath);
 
   const response = await fetch(apiUrl, {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/octet-stream',
     },
     body: imageBuffer,
   });
 
   if (!response.ok) {
-    throw new Error(`AI API responded with status ${response.status}`);
+    let message = `AI API responded with status ${response.status}`;
+
+    try {
+      const errorData = await response.json();
+
+      if (errorData.error) {
+        message += `: ${errorData.error}`;
+      }
+    } catch (_) {
+      // Ignore JSON parsing failure
+    }
+
+    throw new Error(message);
   }
 
   const data = await response.json();
 
-  // Expected provider response: { category: "Pothole", confidence: 0.94 }
-  // Adjust this mapping to match your provider's actual response shape.
+  // Make sure Python returned the expected values
+  if (!data.category || data.confidence === undefined) {
+    throw new Error(
+      'AI API returned an invalid classification response'
+    );
+  }
+
+  // Python model returns confidence between 0 and 1
+  const confidence01 = Number(data.confidence);
+
+  if (
+    !Number.isFinite(confidence01) ||
+    confidence01 < 0 ||
+    confidence01 > 1
+  ) {
+    throw new Error(
+      `Invalid AI confidence returned: ${data.confidence}`
+    );
+  }
+
+  // Make sure the model returned one of our supported civic categories
+  if (!CATEGORIES.includes(data.category)) {
+    throw new Error(
+      `AI returned unsupported category: ${data.category}`
+    );
+  }
+
   return {
     category: data.category,
-    confidence: Math.round(Number(data.confidence) * 100),
+
+    // Convert 0.97 -> 97
+    confidence: Math.round(confidence01 * 100),
+
+    // Keep complete Python response for debugging/logging
     raw: data,
   };
 }
 
 /**
- * Deterministic dev-mode heuristic: hashes the image bytes + the
- * citizen-selected category to produce a stable "confidence" in the
- * 55-97 range, so the same photo always yields the same demo result,
- * and different categories/photos vary the number in a believable way.
- * This is a stand-in for a real model and is clearly not image content
- * analysis — it exists purely so the rest of the pipeline can be built,
- * tested, and demonstrated without requiring AI credentials.
+ * classifyIssueImage
+ *
+ * Sends the uploaded image to the actual Python TensorFlow model.
+ *
+ * @param {string} imagePath
+ *   Absolute path to the stored uploaded image.
+ *
+ * @param {string} selectedCategory
+ *   Category selected by the citizen.
+ *
+ * @returns {Promise<{
+ *   category: string|null,
+ *   confidence: number,
+ *   failed: boolean,
+ *   error?: string,
+ *   raw?: any
+ * }>}
  */
-function devHeuristicClassification(imagePath, selectedCategory) {
-  const buffer = fs.readFileSync(imagePath);
-  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-  const hashInt = parseInt(hash.slice(0, 8), 16);
+async function classifyIssueImage(imagePath, selectedCategory) {
+  try {
+    const result = await callExternalApi(imagePath);
 
-  // Most of the time, "detect" the same category the citizen picked
-  // (simulating a reasonably accurate model); occasionally simulate a
-  // mismatch or a low-confidence result so the mismatch/AI_REVIEW flows
-  // in the UI can actually be exercised during a demo.
-  const roll = hashInt % 100;
-  let category = selectedCategory;
-  if (roll < 8) {
-    // simulate a mismatch
-    const others = CATEGORIES.filter((c) => c !== selectedCategory);
-    category = others[hashInt % others.length];
+    console.log(
+      `[ai.service] Model classification: ${result.category} (${result.confidence}%) | selected: ${selectedCategory}`
+    );
+
+    return {
+      ...result,
+      failed: false,
+    };
+  } catch (err) {
+    console.error(
+      '[ai.service] Classification failed, sending to AI_REVIEW:',
+      err.message
+    );
+
+    return {
+      category: null,
+      confidence: 0,
+      failed: true,
+      error: err.message,
+    };
   }
-
-  let confidence;
-  if (roll < 8) {
-    confidence = 40 + (hashInt % 20); // low confidence mismatch: 40-59
-  } else if (roll < 20) {
-    confidence = 55 + (hashInt % 25); // review band: 55-79
-  } else {
-    confidence = 85 + (hashInt % 13); // auto-pass band: 85-97
-  }
-
-  return { category, confidence, raw: { mode: 'DEV_HEURISTIC', roll } };
 }
 
 /**
- * classifyIssueImage
- * @param {string} imagePath - absolute path to the stored image on disk
- * @param {string} selectedCategory - category the citizen chose
- * @returns {Promise<{category:string, confidence:number, failed:boolean, error?:string}>}
+ * Confidence thresholds
+ *
+ * Example:
+ *
+ * AI_CONFIDENCE_AUTO_PASS=85
+ * AI_CONFIDENCE_REVIEW_MIN=50
  */
-async function classifyIssueImage(imagePath, selectedCategory) {
-  const mode = (process.env.AI_MODE || 'DEV_HEURISTIC').toUpperCase();
-
-  try {
-    if (mode === 'EXTERNAL_API' && process.env.AI_API_URL) {
-      console.log(`[ai.service] calling external model at ${process.env.AI_API_URL}`);
-      const result = await callExternalApi(imagePath);
-      console.log(`[ai.service] external model responded:`, result.category, result.confidence);
-      return { ...result, failed: false };
-    }
-    if (mode === 'EXTERNAL_API' && !process.env.AI_API_URL) {
-      console.warn('[ai.service] AI_MODE=EXTERNAL_API but AI_API_URL is not set — falling back to DEV_HEURISTIC. Check your .env.');
-    }
-    const result = devHeuristicClassification(imagePath, selectedCategory);
-    return { ...result, failed: false };
-  } catch (err) {
-    console.error('[ai.service] Classification failed, falling back to AI_REVIEW:', err.message);
-    return { category: null, confidence: 0, failed: true, error: err.message };
-  }
-}
-
 function getConfidenceThresholds() {
   return {
-    autoPass: Number(process.env.AI_CONFIDENCE_AUTO_PASS || 85),
-    reviewMin: Number(process.env.AI_CONFIDENCE_REVIEW_MIN || 50),
+    autoPass: Number(
+      process.env.AI_CONFIDENCE_AUTO_PASS || 85
+    ),
+
+    reviewMin: Number(
+      process.env.AI_CONFIDENCE_REVIEW_MIN || 50
+    ),
   };
 }
 
 /**
- * Applies the confidence + category-match business rules (Sections 16-17).
- * Returns one of: 'PASS' | 'REVIEW' | 'REJECT'
+ * Applies AI verification rules.
+ *
+ * Rules:
+ *
+ * 1. AI unavailable
+ *    -> REVIEW
+ *
+ * 2. Confidence below review minimum
+ *    -> REJECT
+ *
+ * 3. High confidence AND AI category matches
+ *    citizen selected category
+ *    -> PASS
+ *
+ * 4. Everything else
+ *    -> REVIEW
  */
-function evaluateAiResult({ selectedCategory, aiCategory, aiConfidence, failed }) {
-  if (failed) return 'REVIEW'; // AI unavailable -> human review, never crash/reject outright
+function evaluateAiResult({
+  selectedCategory,
+  aiCategory,
+  aiConfidence,
+  failed,
+}) {
+  // If Python AI server is unavailable,
+  // don't reject the citizen's issue automatically.
+  if (failed) {
+    return 'REVIEW';
+  }
 
-  const { autoPass, reviewMin } = getConfidenceThresholds();
-  const categoryMatches = aiCategory === selectedCategory;
+  const {
+    autoPass,
+    reviewMin,
+  } = getConfidenceThresholds();
 
-  if (aiConfidence < reviewMin) return 'REJECT';
-  if (aiConfidence >= autoPass && categoryMatches) return 'PASS';
-  return 'REVIEW'; // mid-confidence, or high-confidence-but-mismatched category
+  // Compare citizen-selected category
+  // against the actual AI classification.
+  const categoryMatches =
+    aiCategory === selectedCategory;
+
+  // Very low confidence
+  // Very low confidence
+if (aiConfidence < reviewMin) {
+  return 'REJECT';
+}
+
+// High-confidence matching category
+if (aiConfidence >= autoPass && categoryMatches) {
+  return 'PASS';
+}
+
+// AI confidently identified a DIFFERENT civic category.
+// Do not allow submission.
+if (aiConfidence >= autoPass && !categoryMatches) {
+  return 'REJECT';
+}
+
+// Medium-confidence result -> manual review
+return 'REVIEW';
+  // Medium confidence OR category mismatch
+  return 'REVIEW';
 }
 
 module.exports = {

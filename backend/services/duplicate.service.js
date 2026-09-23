@@ -74,8 +74,21 @@ async function checkDuplicate({ category, address, latitude, longitude, excludeI
     );
 
     // Either signal alone can trigger a match — take whichever is stronger.
+    // If both are strongly matched (within 10 points of each other and
+    // both high), report "both" rather than arbitrarily picking one —
+    // that's the literal-same-report case, not a coincidental match on
+    // just one signal.
     const matchScore = Math.max(gpsScore, addressScore);
-    const matchedOn = gpsScore >= addressScore ? 'location' : 'address';
+    let matchedOn;
+    if (gpsScore >= 70 && addressScore >= 70 && Math.abs(gpsScore - addressScore) <= 10) {
+      matchedOn = 'both location and address';
+    } else {
+      matchedOn = gpsScore >= addressScore ? 'location' : 'address';
+    }
+
+    console.log(
+      `[duplicate.service] vs issue #${c.id}: distance=${Math.round(dist)}m gpsScore=${gpsScore} addressScore=${addressScore} -> matchScore=${matchScore} (threshold=${threshold})`
+    );
 
     if (!best || matchScore > best.score) {
       best = {

@@ -37,7 +37,7 @@ export default function Home() {
             Smart Civic Issue Reporting Platform
           </div>
 
-          <h1>
+          <h1 style={{ color: '#f0b646' }}>
             Make your community
             <span> better, one report at a time.</span>
           </h1>
